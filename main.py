@@ -1,581 +1,657 @@
-import base64
-import os.path
+#!/usr/bin/env python3
+import os
 import re
-import argparse
-from datetime import datetime
-from math import atan2
-
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-import torch
-from openai import OpenAI
-from nuscenes import NuScenes
-from pyquaternion import Quaternion
-from scipy.integrate import cumulative_trapezoid
-
 import json
-from openemma.YOLO3D.inference import yolo3d_nuScenes
-from utils import EstimateCurvatureFromTrajectory, IntegrateCurvatureForPoints, OverlayTrajectory, WriteImageSequenceToVideo
-from transformers import MllamaForConditionalGeneration, AutoProcessor, Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration, AutoTokenizer
+import base64
+import argparse
+import tqdm
+from math import atan2
+import time
+import numpy as np
+import torch
 from PIL import Image
-from qwen_vl_utils import process_vision_info
-from llava.model.builder import load_pretrained_model
-from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_PLACEHOLDER
-from llava.utils import disable_torch_init
-from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
-from llava.conversation import conv_templates
+import pickle
+import json
+import matplotlib.pyplot as plt
 
-client = OpenAI(api_key="[your-openai-api-key]")
 
-OBS_LEN = 10
-FUT_LEN = 10
-TTL_LEN = OBS_LEN + FUT_LEN
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
-def getMessage(prompt, image=None, args=None):
+try:
+    from transformers import (
+        AutoProcessor,
+        Qwen2VLForConditionalGeneration,
+        Qwen2_5_VLForConditionalGeneration, 
+        MllamaForConditionalGeneration,
+        AutoTokenizer,
+    )
+except Exception:
+    AutoProcessor = None
+    Qwen2VLForConditionalGeneration = None
+    Qwen2_5_VLForConditionalGeneration = None
+    MllamaForConditionalGeneration = None
+    AutoTokenizer = None
+
+try:
+    from qwen_vl_utils import process_vision_info
+except Exception:
+    process_vision_info = None
+
+# llava imports
+try:
+    from llava.model.builder import load_pretrained_model
+    from llava.constants import (
+        IMAGE_TOKEN_INDEX,
+        DEFAULT_IMAGE_TOKEN,
+        DEFAULT_IM_START_TOKEN,
+        DEFAULT_IM_END_TOKEN,
+        IMAGE_PLACEHOLDER,
+    )
+    from llava.utils import disable_torch_init
+    from llava.mm_utils import tokenizer_image_token, process_images
+    from llava.conversation import conv_templates
+except Exception:
+    load_pretrained_model = None
+
+# Configs
+OBS_LEN = 16
+FUT_LEN = 20
+DT = 0.25
+MAX_NEW_TOKENS = 24
+IMAGE_BUFFER_SIZE = 10
+
+# Image helpers
+def chw_rgb_to_pil(img_chw: np.ndarray) -> Image.Image:
+    """img_chw: (3,H,W) RGB -> PIL RGB"""
+    img_hwc = np.transpose(img_chw, (1, 2, 0))
+    if img_hwc.dtype != np.uint8:
+        mx = float(img_hwc.max()) if img_hwc.size else 1.0
+        if mx <= 1.0:
+            img_hwc = (np.clip(img_hwc, 0.0, 1.0) * 255.0).astype(np.uint8)
+        else:
+            img_hwc = np.clip(img_hwc, 0.0, 255.0).astype(np.uint8)
+    return Image.fromarray(img_hwc, mode="RGB")
+
+def pil_to_data_url(pil_img: Image.Image, fmt: str = "JPEG", quality: int = 90) -> str:
+    """Encode PIL image to data URL for OpenAI vision."""
+    import io
+
+    buff = io.BytesIO()
+    pil_img.save(buff, format=fmt, quality=quality)
+    b64 = base64.b64encode(buff.getvalue()).decode("utf-8")
+    mime = "image/jpeg" if fmt.upper() == "JPEG" else "image/png"
+    return f"data:{mime};base64,{b64}"
+def motion_summary_from_past(obs_ego_xy: np.ndarray, dt: float) -> dict:
+    """
+    Returns v_est, psi (tangent heading in ego frame), kappa estimate, turn_dir.
+    psi=0 means straight ahead; y is left.
+    """
+    xy = np.asarray(obs_ego_xy, float)
+    d = xy[1:] - xy[:-1]
+    keep = np.linalg.norm(d, axis=1) > 1e-4
+    d = d[keep]
+    if len(d) < 3:
+        return dict(v_est=0.0, psi=0.0, kappa=0.0, turn_dir="straight")
+
+    v_est = float(np.linalg.norm(d[-1]) / dt)
+    psi = float(np.arctan2(d[-1, 1], d[-1, 0]))
+
+    psi_seq = np.unwrap(np.arctan2(d[:, 1], d[:, 0]))
+    ds = np.linalg.norm(d, axis=1)
+    m = min(5, len(d))
+    dpsi = float(psi_seq[-1] - psi_seq[-m])
+    s = float(np.sum(ds[-m:]) + 1e-6)
+    kappa = float(dpsi / s)  # signed
+
+    turn_dir = "left" if kappa > 0.01 else ("right" if kappa < -0.01 else "straight")
+    return dict(v_est=v_est, psi=psi, kappa=kappa, turn_dir=turn_dir)
+
+# Frame normalization (works whether pose is already ego@t0 or not)
+def normalize_to_ego_t0(xy: np.ndarray) -> np.ndarray:
+    """
+    Ensures last point is [0,0] and heading aligns with +x (forward).
+    If your pose is already ego@t0 with x forward,y left, this is near-identity.
+    """
+    xy = np.asarray(xy, float)
+    if xy.shape[0] < 2:
+        return xy.copy()
+
+    # Recenter so last is origin
+    xy0 = xy - xy[-1]
+
+    # Align last velocity with +x
+    v = xy[-1] - xy[-2]
+    yaw = atan2(v[1], v[0])  # current heading in this coordinate system
+    c, s = np.cos(-yaw), np.sin(-yaw)
+    R = np.array([[c, -s], [s, c]], dtype=float)  # rotate by -yaw
+    xy1 = xy0 @ R.T
+    return xy1
+
+# VLM inference wrappers
+def getMessage(prompt, image=None, args=None, sys_message=None):
+    """
+    Builds a chat message for different VLM backends.
+
+    For Qwen: supports a list of PIL Images (temporal sequence).
+    For GPT: handled elsewhere.
+    """
+    # Normalize image(s) into a list
+    img_list = []
+    if image is None:
+        img_list = []
+    elif isinstance(image, list):
+        img_list = image
+    else:
+        img_list = [image]
+
     if "llama" in args.model_path or "Llama" in args.model_path:
-        message = [
-            {"role": "user", "content": [
-                {"type": "image"},
-                {"type": "text", "text": prompt}
-            ]}
-        ]
+        # Your llama path currently supports only one image in vlm_inference anyway.
+        # We'll keep a single placeholder.
+        message = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
+        return message
+
     elif "qwen" in args.model_path or "Qwen" in args.model_path:
-        message = [
-            {"role": "user", "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": prompt}
-            ]}
-        ]   
-    return message
+        message = []
+        if sys_message:
+            message.append({"role": "system", "content": [{"type": "text", "text": sys_message}]})
 
+        # Add MULTIPLE images in order (oldest -> newest)
+        content = []
+        for im in img_list:
+            content.append({"type": "image", "image": im})
+        content.append({"type": "text", "text": prompt})
 
-def vlm_inference(text=None, images=None, sys_message=None, processor=None, model=None, tokenizer=None, args=None):
-        if "llama" in args.model_path or "Llama" in args.model_path:
-            image = Image.open(images).convert('RGB')
-            message = getMessage(text, args=args)
-            input_text = processor.apply_chat_template(message, add_generation_prompt=True)
-            inputs = processor(
-                image,
-                input_text,
-                add_special_tokens=False,
-                return_tensors="pt"
-            ).to(model.device)
+        message.append({"role": "user", "content": content})
+        return message
+    return []
 
-            output = model.generate(**inputs, max_new_tokens=2048)
+def vlm_inference(text=None, images=None, sys_message=None, processor=None, model=None, tokenizer=None, args=None, client=None):
+    # LLaMA
+    if ("llama" in args.model_path or "Llama" in args.model_path) and model is not None:
+        image = images
+        if isinstance(images, str):
+            image = Image.open(images).convert("RGB")
+        elif isinstance(images, Image.Image):
+            image = images.convert("RGB")
 
-            output_text = processor.decode(output[0])
+        message = getMessage(text, args=args)
+        input_text = processor.apply_chat_template(message, add_generation_prompt=True)
+        inputs = processor(image, input_text, add_special_tokens=False, return_tensors="pt").to(model.device)
+        output = model.generate(**inputs, max_new_tokens=2048)
+        output_text = processor.decode(output[0])
 
-            if "llama" in args.model_path or "Llama" in args.model_path:
-                output_text = re.findall(r'<\|start_header_id\|>assistant<\|end_header_id\|>(.*?)<\|eot_id\|>', output_text, re.DOTALL)[0].strip()
-            return output_text
-        
-        elif "qwen" in args.model_path or "Qwen" in args.model_path:
-            message = getMessage(text, image=images, args=args)
-            text = processor.apply_chat_template(
-                message, tokenize=False, add_generation_prompt=True
-            )
-            image_inputs, video_inputs = process_vision_info(message)
-            inputs = processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            ).to(model.device)
-            generated_ids = model.generate(**inputs, max_new_tokens=128)
-            generated_ids_trimmed = [
-                out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )
-            return output_text[0]
+        m = re.findall(r"<\|start_header_id\|>assistant<\|end_header_id\|>(.*?)<\|eot_id\|>", output_text, re.DOTALL)
+        return m[0].strip() if m else output_text.strip()
 
-        elif "llava" in args.model_path:
-            conv_mode = "mistral_instruct"
-            image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
-            if IMAGE_PLACEHOLDER in text:
-                if model.config.mm_use_im_start_end:
-                    text = re.sub(IMAGE_PLACEHOLDER, image_token_se, text)
-                else:
-                    text = re.sub(IMAGE_PLACEHOLDER, DEFAULT_IMAGE_TOKEN, text)
+    # Qwen
+    if ("qwen" in args.model_path or "Qwen" in args.model_path) and model is not None:
+        if process_vision_info is None:
+            raise RuntimeError("qwen_vl_utils.process_vision_info not available; install qwen-vl-utils or fix PYTHONPATH.")
+        message = getMessage(text, image=images, args=args, sys_message=sys_message)
+        chat_text = processor.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info(message)
+        inputs = processor(
+            text=[chat_text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        ).to(model.device)
+
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            num_beams=1,
+        )
+
+        generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
+        output_text = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        return output_text[0]
+
+    # LLaVA
+    if "llava" in args.model_path and model is not None:
+        if load_pretrained_model is None:
+            raise RuntimeError("llava not available in this environment.")
+
+        conv_mode = "mistral_instruct"
+        image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+        if IMAGE_PLACEHOLDER in text:
+            if model.config.mm_use_im_start_end:
+                text = re.sub(IMAGE_PLACEHOLDER, image_token_se, text)
             else:
-                if model.config.mm_use_im_start_end:
-                    text = image_token_se + "\n" + text
-                else:
-                    text = DEFAULT_IMAGE_TOKEN + "\n" + text
+                text = re.sub(IMAGE_PLACEHOLDER, DEFAULT_IMAGE_TOKEN, text)
+        else:
+            if model.config.mm_use_im_start_end:
+                text = image_token_se + "\n" + text
+            else:
+                text = DEFAULT_IMAGE_TOKEN + "\n" + text
 
-            conv = conv_templates[conv_mode].copy()
-            conv.append_message(conv.roles[0], text)
-            conv.append_message(conv.roles[1], None)
-            prompt = conv.get_prompt()
+        conv = conv_templates[conv_mode].copy()
+        conv.append_message(conv.roles[0], text)
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
 
-            input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
-            image = Image.open(images).convert('RGB')
+        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).cuda()
 
-            image_tensor = process_images([image], processor, model.config)[0]
+        image = images
+        if isinstance(images, str):
+            image = Image.open(images).convert("RGB")
+        elif isinstance(images, Image.Image):
+            image = images.convert("RGB")
 
-            with torch.inference_mode():
-                output_ids = model.generate(
-                    input_ids,
-                    images=image_tensor.unsqueeze(0).half().cuda(),
-                    image_sizes=[image.size],
-                    do_sample=True,
-                    temperature=0.2,
-                    top_p=None,
-                    num_beams=1,
-                    max_new_tokens=2048,
-                    use_cache=True,
-                    pad_token_id = tokenizer.eos_token_id,
-                )
+        image_tensor = process_images([image], processor, model.config)[0]
+        with torch.inference_mode():
+            output_ids = model.generate(
+                input_ids,
+                images=image_tensor.unsqueeze(0).half().cuda(),
+                image_sizes=[image.size],
+                do_sample=True,
+                temperature=0.2,
+                top_p=None,
+                num_beams=1,
+                max_new_tokens=2048,
+                use_cache=True,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        return tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
 
-            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
-            return outputs
-                    
-        elif "gpt" in args.model_path:
-            PROMPT_MESSAGES = [
-                {
-                    "role": "user",
-                    "content": [
-                        *map(lambda x: {"image": x, "resize": 768}, images),
-                        text,
-                    ],
-                },
-            ]
-            if sys_message is not None:
-                sys_message_dict = {
-                    "role": "system",
-                    "content": sys_message
-                }
-                PROMPT_MESSAGES.append(sys_message_dict)
-            params = {
-                "model": "gpt-4o-2024-11-20",
-                "messages": PROMPT_MESSAGES,
-                "max_tokens": 400,
-            }
+    # GPT (OpenAI API) — expects a client + key
+    if "gpt" in args.model_path:
+        if client is None:
+            raise RuntimeError("OpenAI client not initialized. Install openai and provide a valid API key.")
 
-            result = client.chat.completions.create(**params)
+        # Ensure images is a list of PIL or data URLs
+        if isinstance(images, Image.Image):
+            img_list = [images]
+        elif isinstance(images, list):
+            img_list = images
+        else:
+            img_list = [images]
 
-            return result.choices[0].message.content
+        content = []
+        for im in img_list:
+            if isinstance(im, Image.Image):
+                content.append({"type": "image_url", "image_url": {"url": pil_to_data_url(im), "detail": "low"}})
+            elif isinstance(im, str) and im.startswith("data:image"):
+                content.append({"type": "image_url", "image_url": {"url": im, "detail": "low"}})
+            else:
+                # best effort: try treating as path
+                try:
+                    content.append({"type": "image_url", "image_url": {"url": pil_to_data_url(Image.open(im).convert("RGB")), "detail": "low"}})
+                except Exception:
+                    pass
 
-def SceneDescription(obs_images, processor=None, model=None, tokenizer=None, args=None):
-    prompt = f"""You are a autonomous driving labeller. You have access to these front-view camera images of a car taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Describe the driving scene according to traffic lights, movements of other cars or pedestrians and lane markings."""
+        content.append({"type": "text", "text": text})
 
-    if "llava" in args.model_path:
-        prompt = f"""You are an autonomous driving labeller. You have access to these front-view camera images of a car taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Provide a concise description of the driving scene according to traffic lights, movements of other cars or pedestrians and lane markings."""
+        messages = []
+        if sys_message is not None:
+            messages.append({"role": "system", "content": sys_message})
+        messages.append({"role": "user", "content": content})
 
-    result = vlm_inference(text=prompt, images=obs_images, processor=processor, model=model, tokenizer=tokenizer, args=args)
-    return result
+        # Use chat.completions (your style)
+        resp = client.chat.completions.create(
+            model="gpt-4o-2024-11-20",
+            messages=messages,
+            max_tokens=400,
+        )
+        return resp.choices[0].message.content
 
-def DescribeObjects(obs_images, processor=None, model=None, tokenizer=None, args=None):
+    raise RuntimeError(f"Unsupported model-path: {args.model_path}")
 
-    prompt = f"""You are a autonomous driving labeller. You have access to a front-view camera images of a vehicle taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. What other road users should you pay attention to in the driving scene? List two or three of them, specifying its location within the image of the driving scene and provide a short description of the that road user on what it is doing, and why it is important to you."""
+def SceneDescription(obs_image, processor=None, model=None, tokenizer=None, args=None, client=None):
+    prompt = (
+        "You are an autonomous driving assistant. You have access to this front-view camera image at time t0. "
+        "Describe the driving scene focusing on traffic lights, stop signs, movements of other cars/pedestrians, and lane markings."
+    )
+    return vlm_inference(text=prompt, images=obs_image, processor=processor, model=model, tokenizer=tokenizer, args=args, client=client)
 
-    result = vlm_inference(text=prompt, images=obs_images, processor=processor, model=model, tokenizer=tokenizer, args=args)
+def DescribeObjects(obs_image, processor=None, model=None, tokenizer=None, args=None, client=None):
+    prompt = (
+        "You are an autonomous driving assistant. From this front-view image at time t0, "
+        "list two or three road users you should pay attention to, their approximate location in the image, "
+        "what they are doing, and why they matter."
+    )
+    return vlm_inference(text=prompt, images=obs_image, processor=processor, model=model, tokenizer=tokenizer, args=args, client=client)
 
-    return result
+def DescribeOrUpdateIntent(obs_image, prev_intent=None, processor=None, model=None, tokenizer=None, args=None, client=None):
+    prompt = f"You are an autonomous driving assistant. Your intent is: {prev_intent}. Based on the current image, state your intent now. If you see a stop sign, slow down."
+    return vlm_inference(text=prompt, images=obs_image, processor=processor, model=model, tokenizer=tokenizer, args=args, client=client)
 
-def DescribeOrUpdateIntent(obs_images, prev_intent=None, processor=None, model=None, tokenizer=None, args=None):
+# Waypoint generation
+def GenerateMotion(obs_image, obs_ego_xy, given_intent,
+                   processor=None, model=None, tokenizer=None, args=None, client=None):
 
-    if prev_intent is None:
-        prompt = f"""You are a autonomous driving labeller. You have access to a front-view camera images of a vehicle taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Based on the lane markings and the movement of other cars and pedestrians, describe the desired intent of the ego car. Is it going to follow the lane to turn left, turn right, or go straight? Should it maintain the current speed or slow down or speed up?"""
+    """
+    obs_image: can be a PIL Image (single) OR list[PIL Image] (sequence oldest->newest).
+    """
 
-        if "llava" in args.model_path:
-            prompt = f"""You are a autonomous driving labeller. You have access to a front-view camera images of a vehicle taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Based on the lane markings and the movement of other cars and pedestrians, provide a concise description of the desired intent of  the ego car. Is it going to follow the lane to turn left, turn right, or go straight? Should it maintain the current speed or slow down or speed up?"""
-        
+    # Normalize obs_image(s) to list
+    if isinstance(obs_image, list):
+        img_seq = obs_image
     else:
-        prompt = f"""You are a autonomous driving labeller. You have access to a front-view camera images of a vehicle taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Half a second ago your intent was to {prev_intent}. Based on the updated lane markings and the updated movement of other cars and pedestrians, do you keep your intent or do you change it? Explain your current intent: """
+        img_seq = [obs_image]
 
-        if "llava" in args.model_path:
-            prompt = f"""You are a autonomous driving labeller. You have access to a front-view camera images of a vehicle taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Half a second ago your intent was to {prev_intent}. Based on the updated lane markings and the updated movement of other cars and pedestrians, do you keep your intent or do you change it? Provide a concise description explanation of your current intent: """
-
-    result = vlm_inference(text=prompt, images=obs_images, processor=processor, model=model, tokenizer=tokenizer, args=args)
-
-    return result
-
-
-def GenerateMotion(obs_images, obs_waypoints, obs_velocities, obs_curvatures, given_intent, processor=None, model=None, tokenizer=None, args=None):
-    # assert len(obs_images) == len(obs_waypoints)
-
-    scene_description, object_description, intent_description = None, None, None
-
+    scene_description = object_description = intent_description = None
     if args.method == "openemma":
-        scene_description = SceneDescription(obs_images, processor=processor, model=model, tokenizer=tokenizer, args=args)
-        object_description = DescribeObjects(obs_images, processor=processor, model=model, tokenizer=tokenizer, args=args)
-        intent_description = DescribeOrUpdateIntent(obs_images, prev_intent=given_intent, processor=processor, model=model, tokenizer=tokenizer, args=args)
-        print(f'Scene Description: {scene_description}')
-        print(f'Object Description: {object_description}')
-        print(f'Intent Description: {intent_description}')
+        scene_prompt = (
+            "You are an autonomous driving assistant. You are given a TIME-ORDERED sequence of front-view images "
+            "(oldest -> newest). The LAST image is the current time t0. "
+            "Describe the scene at t0, using earlier frames to infer motion (traffic lights, other vehicles, pedestrians, lane markings). Especially, the current lane's curvature."
+        )
+        obj_prompt = (
+            "You are an autonomous driving assistant. You are given a TIME-ORDERED sequence of front-view images "
+            "(oldest -> newest). The LAST image is time t0. "
+            "List 2-3 important road users at t0 and describe their motion using the earlier frames."
+        )
+        intent_prompt = (
+            f"You are an autonomous driving assistant. You are given a TIME-ORDERED sequence of front-view images "
+            f"(oldest -> newest). The LAST image is time t0. "
+            f"The previous intent label is: {given_intent}, note that the ego vehicle may be in the middle of a turn."
+            f"Based on the sequence (especially traffic lights and lane geometry), describe the ego vehicle's current intent from: turn left, stay in current lane, turn right."
+        )
 
-    # Convert array waypoints to string.
-    obs_waypoints_str = [f"[{x[0]:.2f},{x[1]:.2f}]" for x in obs_waypoints]
-    obs_waypoints_str = ", ".join(obs_waypoints_str)
-    obs_velocities_norm = np.linalg.norm(obs_velocities, axis=1)
-    obs_curvatures = obs_curvatures * 100
-    obs_speed_curvature_str = [f"[{x[0]:.1f},{x[1]:.1f}]" for x in zip(obs_velocities_norm, obs_curvatures)]
-    obs_speed_curvature_str = ", ".join(obs_speed_curvature_str)
+        scene_description = vlm_inference(
+            text=scene_prompt, images=img_seq,
+            processor=processor, model=model, tokenizer=tokenizer, args=args, client=client
+        )
+        object_description = vlm_inference(
+            text=obj_prompt, images=img_seq,
+            processor=processor, model=model, tokenizer=tokenizer, args=args, client=client
+        )
+        intent_description = vlm_inference(
+            text=intent_prompt, images=img_seq,
+            processor=processor, model=model, tokenizer=tokenizer, args=args, client=client
+        )
 
+        print(f"Scene Description: {scene_description}")
+        print(f"Object Description: {object_description}")
+        print(f"Intent Description: {intent_description}")
+
+    # Kinematic summary from past waypoints
+    summ = motion_summary_from_past(obs_ego_xy, DT)
+    v_est, psi, kappa, turn_dir = summ["v_est"], summ["psi"], summ["kappa"], summ["turn_dir"]
+
+    dx_est = float(v_est * DT)
+
+    # stringify past
+    obs_xy_str = ", ".join([f"[{p[0]:.2f},{p[1]:.2f}]" for p in np.asarray(obs_ego_xy)])
+
+    sys_message = (
+        f"You are an autonomous driving assistant.\n"
+        f"You are given a TIME-ORDERED sequence of front-view images (oldest -> newest). "
+        f"The LAST image is the current time t0.\n"
+        f"You also receive the last {OBS_LEN} ego-frame waypoints of the ego vehicle relative to t0.\n\n"
+        f"Ego-frame definition:\n"
+        f"- x is forward (meters), y is left (meters)\n"
+        f"- waypoint at t0 is [0,0]\n"
+        f"- past waypoints are behind the vehicle (typically x <= 0)\n\n"
+        f"Scene description: {scene_description}"
+        f"Task: Predict the next {FUT_LEN} ego-frame waypoints for t0+dt,...,t0+{FUT_LEN}*dt, where dt = {DT} seconds.\n"
+        f"Return ONLY valid JSON.\n"
+    )
+
+    prompt = f"""
+    Past ego-frame waypoints (oldest->newest), dt={DT:.2f}s:
+    {obs_xy_str}
+
+    From past waypoints:
+    - estimated speed v≈{v_est:.2f} m/s so typical forward step dx≈{dx_est:.2f} m (unless stopping)
+
+    TASK:
+    Predict future motion that stays in the CURRENT LANE at t0 and follows the lane curvature seen in the LAST image.
+    The lane may curve even if the past waypoints look straight.
+
+    INTERNAL STEPS (do this silently):
+    1) Look at the LAST image and identify the ego lane:
+    - lane centerline direction ahead (does it bend left or right?)
+    - approximate curvature strength (mild / medium / sharp)
+    - use double-yellow line + curb/road edge to decide the ego lane region.
     
-    print(f'Observed Speed and Curvature: {obs_speed_curvature_str}')
+    2) Decide the lane-following curvature direction:
+    - If the lane bends RIGHT ahead, cumulative y should become NEGATIVE over time (y is left).
+    - If the lane bends LEFT ahead, cumulative y should become POSITIVE.
+    - If the lane is straight, cumulative y stays near 0.
+    3) Generate deltas that follow that curvature smoothly.
 
-    sys_message = ("You are a autonomous driving labeller. You have access to a front-view camera image of a vehicle, a sequence of past speeds, a sequence of past curvatures, and a driving rationale. Each speed, curvature is represented as [v, k], where v corresponds to the speed, and k corresponds to the curvature. A positive k means the vehicle is turning left. A negative k means the vehicle is turning right. The larger the absolute value of k, the sharper the turn. A close to zero k means the vehicle is driving straight. As a driver on the road, you should follow any common sense traffic rules. You should try to stay in the middle of your lane. You should maintain necessary distance from the leading vehicle. You should observe lane markings and follow them.  Your task is to do your best to predict future speeds and curvatures for the vehicle over the next 10 timesteps given vehicle intent inferred from the image. Make a best guess if the problem is too difficult for you. If you cannot provide a response people will get injured.\n")
+    RULES:
+    - dx_i >= 0 and usually near {dx_est:.2f} if moving (smooth changes only).
+    - dy_i must reflect the lane curvature from the LAST image (not from past waypoints).
+    - Smoothness: dy_i should change gradually (no sudden jumps).
+    - Lane-keeping: total lateral displacement |y| should usually stay within ~2.0 m unless clearly changing lanes. Leave equal margin to both boundaries
+    - If the lane curves right, do NOT output all dy_i≈0.
 
-    if args.method == "openemma":
-        prompt = f"""These are frames from a video taken by a camera mounted in the front of a car. The images are taken at a 0.5 second interval. 
-        The scene is described as follows: {scene_description}. 
-        The identified critical objects are {object_description}. 
-        The car's intent is {intent_description}. 
-        The 5 second historical velocities and curvatures of the ego car are {obs_speed_curvature_str}. 
-        Infer the association between these numbers and the image sequence. Generate the predicted future speeds and curvatures in the format [speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. Write the raw text not markdown or latex. Future speeds and curvatures:"""
+    SELF-CHECK (do silently):
+    After producing deltas, accumulate to points (x_k, y_k) and verify in the LAST image:
+    1) The curve direction matches the lane centerline ahead.
+    2) Points stay centered in the lane: not near the curb/right edge.
+    3) Keep a visible gap to the curb/sidewalk; do not place points on the shoulder/parking area.
+    If any point approaches the curb/edge, shift dy values slightly LEFT (increase y) while keeping curvature direction.
+    - If the lane bends right, dy should be negative overall, BUT not so negative that you move into the curb; keep the lane-center offset.
+    4) If following the current lane, estimate the left lane boundary and right lane boundary. Plan a path that stays approximately midway between them.
+
+    OUTPUT ONLY JSON with EXACTLY {FUT_LEN} deltas:
+    {{"deltas":[[dx1,dy1],[dx2,dy2],...,[dx{FUT_LEN},dy{FUT_LEN}]]}}
+    """.strip()
+    
+    
+    out = vlm_inference(
+        text=prompt,
+        images=img_seq,
+        sys_message=sys_message,
+        processor=processor, model=model, tokenizer=tokenizer, args=args,
+        client=client
+    )
+
+    return out, scene_description, object_description, intent_description
+
+def fix_deltas_to_len(deltas, fut_len, obs_ego_xy, dt):
+    deltas = np.asarray(deltas, dtype=float)
+
+    # sanitize shape
+    if deltas.ndim != 2 or deltas.shape[1] != 2:
+        deltas = deltas.reshape(-1, 2)
+
+    n = deltas.shape[0]
+    if n == fut_len:
+        return deltas
+
+    # estimate a reasonable forward dx for padding
+    summ = motion_summary_from_past(obs_ego_xy, dt)
+    dx_est = max(0.05, float(summ["v_est"] * dt))  # at least 5 cm step
+
+    if n == 0:
+        pad = np.tile(np.array([[dx_est, 0.0]], dtype=float), (fut_len, 1))
+        return pad
+
+    if n < fut_len:
+        # pad with last delta but ensure forward progress
+        last = deltas[-1:].copy()
+        last[0, 0] = max(last[0, 0], dx_est)
+        pad = np.repeat(last, fut_len - n, axis=0)
+        deltas = np.vstack([deltas, pad])
     else:
-        prompt = f"""These are frames from a video taken by a camera mounted in the front of a car. The images are taken at a 0.5 second interval. 
-        The 5 second historical velocities and curvatures of the ego car are {obs_speed_curvature_str}. 
-        Infer the association between these numbers and the image sequence. Generate the predicted future speeds and curvatures in the format [speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. Write the raw text not markdown or latex. Future speeds and curvatures:"""
-    for rho in range(3):
-        result = vlm_inference(text=prompt, images=obs_images, sys_message=sys_message, processor=processor, model=model, tokenizer=tokenizer, args=args)
-        if not "unable" in result and not "sorry" in result and "[" in result:
-            break
-    return result, scene_description, object_description, intent_description
+        deltas = deltas[:fut_len]
 
-if __name__ == '__main__':
+    return deltas
+
+def load_dict_from_pickle(path: str) -> dict:
+    with open(path,'rb') as f:
+        return pickle.load(f)
+
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, default="gpt")
     parser.add_argument("--plot", type=bool, default=True)
-    parser.add_argument("--dataroot", type=str, default='datasets/NuScenes')
-    parser.add_argument("--version", type=str, default='v1.0-mini')
-    parser.add_argument("--method", type=str, default='openemma')
+    parser.add_argument("--method", type=str, default="openemma")
+    parser.add_argument("--dataset", type=str, default="testing")
+    parser.add_argument("--dataset-dir", type=str, required=True, description='Path to Waymo E2E Preprocessed Dataset')
     args = parser.parse_args()
+    print(args.model_path)
 
-    print(f"{args.model_path}")
+    # Initialize OpenAI client (only if needed)
+    client = None
+    if "gpt" in args.model_path:
+        if OpenAI is None:
+            raise RuntimeError("openai package not found but --model-path is gpt.")
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("Set OPENAI_API_KEY in your environment for --model-path gpt.")
+        client = OpenAI(api_key=api_key)
 
-    model = None
-    processor = None
-    tokenizer = None
-    qwen25_loaded = False
+    model = processor = tokenizer = None
+
+    # Load local VLMs
     try:
-        # 优先本地加载Qwen2.5-VL-3B-Instruct，并优选flash attention
-        if "qwen" in args.model_path or "Qwen" in args.model_path:
+        if ("qwen" in args.model_path or "Qwen" in args.model_path) and AutoProcessor is not None:
+            # Try Qwen2.5 first (local path)
             try:
+                if Qwen2_5_VLForConditionalGeneration is None:
+                    raise RuntimeError("Qwen2_5_VLForConditionalGeneration not available in transformers.")
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     "/root/OpenEMMA/models/Qwen2.5-VL-3B-Instruct",
                     torch_dtype=torch.bfloat16,
                     attn_implementation="flash_attention_2",
-                    device_map="auto"
+                    device_map="auto",
                 )
                 processor = AutoProcessor.from_pretrained("/root/OpenEMMA/models/Qwen2.5-VL-3B-Instruct")
                 tokenizer = None
-                qwen25_loaded = True
-                print("已本地加载 Qwen2.5-VL-3B-Instruct 并启用 flash attention。")
+                print("Loaded local Qwen2.5-VL-3B-Instruct (flash attention).")
             except Exception as e:
-                print("Qwen2.5-VL-3B-Instruct 加载失败，尝试加载 Qwen2-VL-7B-Instruct。")
-                print(e)
+                print("Falling back to Qwen2-VL-7B-Instruct:", e)
                 model = Qwen2VLForConditionalGeneration.from_pretrained(
                     "Qwen/Qwen2-VL-7B-Instruct",
                     torch_dtype=torch.bfloat16,
-                    device_map="auto"
+                    device_map="auto",
                 )
                 processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
                 tokenizer = None
-                qwen25_loaded = False
-                print("已加载 Qwen2-VL-7B-Instruct。")
-        else:
-            if "llava" == args.model_path:    
-                disable_torch_init()
-                tokenizer, model, processor, context_len = load_pretrained_model("liuhaotian/llava-v1.6-mistral-7b", None, "llava-v1.6-mistral-7b")
-                image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
-            elif "llava" in args.model_path:
-                disable_torch_init()
-                tokenizer, model, processor, context_len = load_pretrained_model(args.model_path, None, "llava-v1.6-mistral-7b")
-                image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+                print("Loaded Qwen2-VL-7B-Instruct.")
+
+        elif "llava" in args.model_path and load_pretrained_model is not None:
+            disable_torch_init()
+            if args.model_path == "llava":
+                tokenizer, model, processor, _ = load_pretrained_model(
+                    "liuhaotian/llava-v1.6-mistral-7b", None, "llava-v1.6-mistral-7b"
+                )
             else:
-                model = None
-                processor = None
-                tokenizer=None
+                tokenizer, model, processor, _ = load_pretrained_model(args.model_path, None, "llava-v1.6-mistral-7b")
+            print("Loaded LLaVA.")
+
+        elif ("llama" in args.model_path or "Llama" in args.model_path) and MllamaForConditionalGeneration is not None:
+            # If you use LLaMA vision locally, set your path here.
+            raise RuntimeError("LLaMA vision loading not configured in this script.")
+
     except Exception as e:
-        print("模型加载出现异常：", e)
+        print("Model load error:", e)
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    timestamp = args.model_path + f"_results/{args.method}/" + timestamp
-    os.makedirs(timestamp, exist_ok=True)
+    #  Load the dataset (your pickle) 
+    if args.dataset == 'testing':
+        with open('waymo_testing_segments.json', 'r') as f:
+            segments_json = json.load(f) # Reads and parses JSON from a file
+    elif args.dataset == 'val':
+        with open('waymo_val_segments.json', 'r') as f:
+            segments_json = json.load(f) # Reads and parses JSON from a file
+    else:
+        NotImplementedError
 
-    # Load the dataset
-    nusc = NuScenes(version=args.version, dataroot=args.dataroot)
+    skip = True
+    for id in tqdm.tqdm(segments_json.keys()):
+        if id == '588746b8473d273a6aee6f79b1b87781':
+            skip = False
+        if skip: continue
+        outdir = os.path.join(f"{args.model_path}_results", args.method, args.dataset,id)
+        print(outdir, ' created')
+        os.makedirs(outdir, exist_ok=True)
 
-    # Iterate the scenes
-    scenes = nusc.scene
-    
-    print(f"Number of scenes: {len(scenes)}")
+        image_history = []
+        for segment in segments_json[id]:
+            data_dict = load_dict_from_pickle(args.dataset_dir + args.dataset + "/" + id + "-" + str(segment) + '.pkl')
 
-    for scene in scenes:
-        token = scene['token']
-        first_sample_token = scene['first_sample_token']
-        last_sample_token = scene['last_sample_token']
-        name = scene['name']
-        description = scene['description']
+            #  Build stitched image (front-left, front, front-right) 
+            cam_list = [1, 0, 2]
+            cam_front_data = []
+            for cam in cam_list:
+                cam_front_data.append(data_dict["image_frames"][cam, ...].numpy().squeeze(0))  # (3,H,W)
+            cam_front_data = np.concatenate(cam_front_data, axis=-1)  # concat width
+            curr_image = chw_rgb_to_pil(cam_front_data)
+            image_history.append(curr_image)
 
-        if not name in ["scene-0103", "scene-1077"]:
-            continue
+        image_history = image_history[-IMAGE_BUFFER_SIZE:] #only use last  frames
 
-        # Get all image and pose in this scene
-        front_camera_images = []
-        ego_poses = []
-        camera_params = []
-        curr_sample_token = first_sample_token
-        while True:
-            sample = nusc.get('sample', curr_sample_token)
+        #  Pose / trajectory 
+        #Use last frame only for ego pose/trajectory
+        pose = data_dict["ego_history_xyz"].squeeze(0).squeeze(0).numpy()  # (T,3)
+        xy = pose[:, :2].astype(float)
 
-            # Get the front camera image of the sample.
-            cam_front_data = nusc.get('sample_data', sample['data']['CAM_FRONT'])
-            # nusc.render_sample_data(cam_front_data['token'])
+        # Normalize to ego@t0 so last observed is [0,0] and heading aligns +x
+        xy_ego = xy.copy()  # already vehicle frame (x forward, y left)
+        # Ensure t0 origin is exactly [0,0] at the last observed waypoint
+        xy_ego = xy_ego - xy_ego[OBS_LEN-1:OBS_LEN, :]  # subtract t0 (broadcast)
+
+        obs_ego_xy = xy_ego[:OBS_LEN, :]
 
 
-            if "gpt" in args.model_path:
-                with open(os.path.join(nusc.dataroot, cam_front_data['filename']), "rb") as image_file:
-                    front_camera_images.append(base64.b64encode(image_file.read()).decode('utf-8'))
-            else:
-                front_camera_images.append(os.path.join(nusc.dataroot, cam_front_data['filename']))
+        # Print the past waypoints you feed the model (debug)
+        obs_xy_str = ", ".join([f"[{p[0]:.2f},{p[1]:.2f}]" for p in obs_ego_xy])
+        print(f"Observed ego-frame waypoints (oldest->newest): {obs_xy_str}")
 
-            # Get the ego pose of the sample.
-            pose = nusc.get('ego_pose', cam_front_data['ego_pose_token'])
-            ego_poses.append(pose)
+        prev_intent = data_dict.get("ego_intent", "UNKNOWN")
 
-            # Get the camera parameters of the sample.
-            camera_params.append(nusc.get('calibrated_sensor', cam_front_data['calibrated_sensor_token']))
+        #  Generate motion 
+        st = time.time()
+        prediction_text, scene_desc, obj_desc, intent_desc = GenerateMotion(
+            obs_image=image_history,
+            obs_ego_xy=obs_ego_xy,
+            given_intent=prev_intent,
+            processor=processor, model=model, tokenizer=tokenizer, args=args,
+            client=client
+        )
+        print(f'Generating Motion took {time.time() - st} seconds')
+        #  Parse JSON 
+        m = re.search(r"\{.*\}", prediction_text, re.DOTALL)
+        obj = json.loads(m.group(0))
+        deltas = fix_deltas_to_len(obj.get("deltas", []), FUT_LEN, obs_ego_xy, DT)
+        ego_wps = np.cumsum(deltas, axis=0)
+        pred_xy = ego_wps[:FUT_LEN]
 
-            # Advance the pointer.
-            if curr_sample_token == last_sample_token:
-                break
-            curr_sample_token = sample['next']
+        print("model deltas len:", len(obj.get("deltas", [])), "-> after fix:", deltas.shape[0])
 
-        scene_length = len(front_camera_images)
-        print(f"Scene {name} has {scene_length} frames")
+        #append z
+        pred_xyz = np.zeros((FUT_LEN,3))
+        pred_xyz[:,2] = pose[-1,2]
+        pred_xyz[:,:2] = pred_xy
+        print(f"Got {pred_xy.shape[0]} future waypoints. "
+            f"pred y-range={np.ptp(pred_xy[:,1]) if pred_xy.size else 0:.2f}")
 
-        if scene_length < TTL_LEN:
-            print(f"Scene {name} has less than {TTL_LEN} frames, skipping...")
-            continue
-
-        ## Compute interpolated trajectory.
-        # Get the velocities of the ego vehicle.
-        ego_poses_world = [ego_poses[t]['translation'][:3] for t in range(scene_length)]
-        ego_poses_world = np.array(ego_poses_world)
-        plt.plot(ego_poses_world[:, 0], ego_poses_world[:, 1], 'r-', label='GT')
-
-        ego_velocities = np.zeros_like(ego_poses_world)
-        ego_velocities[1:] = ego_poses_world[1:] - ego_poses_world[:-1]
-        ego_velocities[0] = ego_velocities[1]
-
-        # Get the curvature of the ego vehicle.
-        ego_curvatures = EstimateCurvatureFromTrajectory(ego_poses_world)
-        ego_velocities_norm = np.linalg.norm(ego_velocities, axis=1)
-        estimated_points = IntegrateCurvatureForPoints(ego_curvatures, ego_velocities_norm, ego_poses_world[0],
-                                                       atan2(ego_velocities[0][1], ego_velocities[0][0]), scene_length)
-
-        # Debug
-        if args.plot:
-            plt.quiver(ego_poses_world[:, 0], ego_poses_world[:, 1], ego_velocities[:, 0], ego_velocities[:, 1],
-                    color='b')
-            plt.plot(estimated_points[:, 0], estimated_points[:, 1], 'g-', label='Reconstruction')
+        #  Plot in ego frame (simple, interpretable) 
+        if args.plot and plt is not None:
+            plt.figure()
+            plt.plot(obs_ego_xy[:, 0], obs_ego_xy[:, 1], "k.-", label="Past (ego@t0)")
+            plt.plot(pred_xy[:, 0], pred_xy[:, 1], "b.-", label="Pred future (ego@t0)")
+            plt.axis("equal")
             plt.legend()
-            plt.savefig(f"{timestamp}/{name}_interpolation.jpg")
+            plt.grid(True)
+            plt.savefig(os.path.join(outdir, "ego_frame_pred_vs_gt.png"))
             plt.close()
 
-        # Get the waypoints of the ego vehicle.
-        ego_traj_world = [ego_poses[t]['translation'][:3] for t in range(scene_length)]
+        #  Save outputs 
+        np.save(os.path.join(outdir, "pred_xyz.npy"), pred_xyz)
 
-        prev_intent = None
-        cam_images_sequence = []
-        ade1s_list = []
-        ade2s_list = []
-        ade3s_list = []
-        for i in range(scene_length - TTL_LEN):
-            # Get the raw image data.
-            # utils.PlotBase64Image(front_camera_images[0])
-            obs_images = front_camera_images[i:i+OBS_LEN]
-            obs_ego_poses = ego_poses[i:i+OBS_LEN]
-            obs_camera_params = camera_params[i:i+OBS_LEN]
-            obs_ego_traj_world = ego_traj_world[i:i+OBS_LEN]
-            fut_ego_traj_world = ego_traj_world[i+OBS_LEN:i+TTL_LEN]
-            obs_ego_velocities = ego_velocities[i:i+OBS_LEN]
-            obs_ego_curvatures = ego_curvatures[i:i+OBS_LEN]
+        print(pred_xy)
+        with open(os.path.join(outdir, "logs.txt"), "w") as f:
+            f.write(f"Scene Description: {scene_desc}\n")
+            f.write(f"Object Description: {obj_desc}\n")
+            f.write(f"Intent Description: {intent_desc}\n")
+            f.write(f"Raw Prediction:\n{prediction_text}\n")
 
-            # Get positions of the vehicle.
-            obs_start_world = obs_ego_traj_world[0]
-            fut_start_world = obs_ego_traj_world[-1]
-            curr_image = obs_images[-1]
-
-            # obs_images = [curr_image]
-
-            # Allocate the images.
-            if "gpt" in args.model_path:
-                img = cv2.imdecode(np.frombuffer(base64.b64decode(curr_image), dtype=np.uint8), cv2.IMREAD_COLOR)
-                img = yolo3d_nuScenes(img, calib=obs_camera_params[-1])[0]
-            else:
-                with open(os.path.join(curr_image), "rb") as image_file:
-                    img = cv2.imdecode(np.frombuffer(image_file.read(), dtype=np.uint8), cv2.IMREAD_COLOR)
-
-            for rho in range(3):
-                # Assemble the prompt.
-                if not "gpt" in args.model_path:
-                    obs_images = curr_image
-                (prediction,
-                scene_description,
-                object_description,
-                updated_intent) = GenerateMotion(obs_images, obs_ego_traj_world, obs_ego_velocities,
-                                                obs_ego_curvatures, prev_intent, processor=processor, model=model, tokenizer=tokenizer, args=args)
-
-                # Process the output.
-                prev_intent = updated_intent  # Stateful intent
-                pred_waypoints = prediction.replace("Future speeds and curvatures:", "").strip()
-                coordinates = re.findall(r"\[([-+]?\d*\.?\d+),\s*([-+]?\d*\.?\d+)\]", pred_waypoints)
-                if not coordinates == []:
-                    break
-            if coordinates == []:
-                continue
-            speed_curvature_pred = [[float(v), float(k)] for v, k in coordinates]
-            speed_curvature_pred = speed_curvature_pred[:10]
-            print(f"Got {len(speed_curvature_pred)} future actions: {speed_curvature_pred}")
-
-            # GT
-            # OverlayTrajectory(img, fut_ego_traj_world, obs_camera_params[-1], obs_ego_poses[-1], color=(255, 0, 0))
-
-            # Pred
-            pred_len = min(FUT_LEN, len(speed_curvature_pred))
-            pred_curvatures = np.array(speed_curvature_pred)[:, 1] / 100
-            pred_speeds = np.array(speed_curvature_pred)[:, 0]
-            pred_traj = np.zeros((pred_len, 3))
-            pred_traj[:pred_len, :2] = IntegrateCurvatureForPoints(pred_curvatures,
-                                                                   pred_speeds,
-                                                                   fut_start_world,
-                                                                   atan2(obs_ego_velocities[-1][1],
-                                                                         obs_ego_velocities[-1][0]), pred_len)
-
-            # Overlay the trajectory.
-            check_flag = OverlayTrajectory(img, pred_traj.tolist(), obs_camera_params[-1], obs_ego_poses[-1], color=(255, 0, 0), args=args)
-            
-
-            # Compute ADE.
-            fut_ego_traj_world = np.array(fut_ego_traj_world)
-            ade = np.mean(np.linalg.norm(fut_ego_traj_world[:pred_len] - pred_traj, axis=1))
-            
-            pred1_len = min(pred_len, 2)
-            ade1s = np.mean(np.linalg.norm(fut_ego_traj_world[:pred1_len] - pred_traj[1:pred1_len+1] , axis=1))
-            ade1s_list.append(ade1s)
-
-            pred2_len = min(pred_len, 4)
-            ade2s = np.mean(np.linalg.norm(fut_ego_traj_world[:pred2_len] - pred_traj[:pred2_len] , axis=1))
-            ade2s_list.append(ade2s)
-
-            pred3_len = min(pred_len, 6)
-            ade3s = np.mean(np.linalg.norm(fut_ego_traj_world[:pred3_len] - pred_traj[:pred3_len] , axis=1))
-            ade3s_list.append(ade3s)
-
-            # Write to image.
-            if args.plot == True:
-                cam_images_sequence.append(img.copy())
-                cv2.imwrite(f"{timestamp}/{name}_{i}_front_cam.jpg", img)
-
-                # Plot the trajectory.
-                plt.plot(fut_ego_traj_world[:, 0], fut_ego_traj_world[:, 1], 'r-', label='GT')
-                plt.plot(pred_traj[:, 0], pred_traj[:, 1], 'b-', label='Pred')
-                plt.legend()
-                plt.title(f"Scene: {name}, Frame: {i}, ADE: {ade}")
-                plt.savefig(f"{timestamp}/{name}_{i}_traj.jpg")
-                plt.close()
-
-                # Save the trajectory
-                np.save(f"{timestamp}/{name}_{i}_pred_traj.npy", pred_traj)
-                np.save(f"{timestamp}/{name}_{i}_pred_curvatures.npy", pred_curvatures)
-                np.save(f"{timestamp}/{name}_{i}_pred_speeds.npy", pred_speeds)
-
-                # Save the descriptions
-                with open(f"{timestamp}/{name}_{i}_logs.txt", 'w') as f:
-                    f.write(f"Scene Description: {scene_description}\n")
-                    f.write(f"Object Description: {object_description}\n")
-                    f.write(f"Intent Description: {updated_intent}\n")
-                    f.write(f"Average Displacement Error: {ade}\n")
-
-            # break  # Timestep
-
-        mean_ade1s = np.mean(ade1s_list)
-        mean_ade2s = np.mean(ade2s_list)
-        mean_ade3s = np.mean(ade3s_list)
-        aveg_ade = np.mean([mean_ade1s, mean_ade2s, mean_ade3s])
-
-        result = {
-            "name": name,
-            "token": token,
-            "ade1s": mean_ade1s,
-            "ade2s": mean_ade2s,
-            "ade3s": mean_ade3s,
-            "avgade": aveg_ade
-        }
-
-        with open(f"{timestamp}/ade_results.jsonl", "a") as f:
-            f.write(json.dumps(result))
-            f.write("\n")
-
-        if args.plot:
-            WriteImageSequenceToVideo(cam_images_sequence, f"{timestamp}/{name}")
-
-        # break  # Scenes
+        print("Saved to:", outdir)
 
 
-def vlm_inference(text=None, images=None, sys_message=None, processor=None, model=None, tokenizer=None, args=None):
-    if ("qwen" in args.model_path or "Qwen" in args.model_path):
-        # 判断是否为Qwen2.5-VL-3B-Instruct（新版）
-        if hasattr(model, "model_type") and getattr(model, "model_type", "") == "qwen2_5_vl":
-            # Qwen2.5-VL-3B-Instruct官方推荐推理方式
-            message = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": images},
-                        {"type": "text", "text": text}
-                    ]
-                }
-            ]
-            text_prompt = processor.apply_chat_template(
-                message, tokenize=False, add_generation_prompt=True
-            )
-            image_inputs, video_inputs = process_vision_info(message)
-            inputs = processor(
-                text=[text_prompt],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            )
-            inputs = inputs.to(model.device)
-            generated_ids = model.generate(**inputs, max_new_tokens=128)
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )
-            return output_text[0]
-        else:
-            # 兼容Qwen2-VL-7B-Instruct等老模型
-            message = getMessage(text, image=images, args=args)
-            text_prompt = processor.apply_chat_template(
-                message, tokenize=False, add_generation_prompt=True
-            )
-            image_inputs, video_inputs = process_vision_info(message)
-            inputs = processor(
-                text=[text_prompt],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            ).to(model.device)
-            generated_ids = model.generate(**inputs, max_new_tokens=128)
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )
-            return output_text[0]
-    # ... 其它模型推理逻辑保持不变 ...
-
+if __name__ == "__main__":
+    main()

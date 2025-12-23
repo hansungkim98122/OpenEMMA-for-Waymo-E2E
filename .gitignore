@@ -18,3 +18,9 @@ env/
 
 # Project specific
 gpt_results/
+
+qwen_results
+llava_results
+gpt_results
+submission
+waymo_dataset

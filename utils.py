@@ -272,28 +272,30 @@ def EstimateCurvatureFromTrajectory(traj):
 
     return curvature
 
-def IntegrateCurvatureForPoints(curvatures, velocities_norm, initial_position, initial_heading, time_span):
-    t = np.linspace(0, time_span, time_span)  # Time vector
+from scipy.integrate import cumulative_trapezoid
+import numpy as np
 
-    # Initial conditions
-    x0, y0 = initial_position[0], initial_position[1]  # Starting position
-    theta0 = initial_heading  # Initial orientation (radians)
+def IntegrateCurvatureForPoints(curvatures, speeds, initial_position, initial_heading, num_steps, dt):
+    curvatures = np.asarray(curvatures, float).reshape(-1)
+    speeds     = np.asarray(speeds, float).reshape(-1)
+    n = min(num_steps, len(curvatures), len(speeds))
+    curvatures = curvatures[:n]
+    speeds     = speeds[:n]
 
-    # Integrate to compute heading (theta)
-    theta = cumulative_trapezoid(curvatures * velocities_norm, t, initial=0)
-    theta += theta0  # 手动加上初始角度
+    t = np.arange(n) * dt  # <-- this matters
 
-    # Compute velocity components
-    v_x = velocities_norm * np.cos(theta)
-    v_y = velocities_norm * np.sin(theta)
+    # theta_dot = v * k
+    theta = cumulative_trapezoid(curvatures * speeds, t, initial=0.0) + float(initial_heading)
 
-    # Integrate to compute trajectory
-    x = cumulative_trapezoid(v_x, t, initial=0)
-    y = cumulative_trapezoid(v_y, t, initial=0)
-    x += x0  # 手动加上初始位置
-    y += y0
+    vx = speeds * np.cos(theta)
+    vy = speeds * np.sin(theta)
 
-    return np.stack((x, y), axis=1)
+    x = cumulative_trapezoid(vx, t, initial=0.0) + float(initial_position[0])
+    y = cumulative_trapezoid(vy, t, initial=0.0) + float(initial_position[1])
+
+    return np.stack([x, y], axis=1)
+
+
 
 def WriteImageSequenceToVideo(cam_images_sequence: list, filename):
     assert len(cam_images_sequence) >= 1, "No images to write to video."
