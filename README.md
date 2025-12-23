@@ -1,146 +1,62 @@
-<p align="center" width="60%">
-<img src="assets/logo.png" alt="OpenEMMA" style="width: 35%; min-width: 200px; display: block; margin: auto; background-color: transparent;">
-</p>
-
-<p align="center">
-    <a href="README.md"><strong>English</strong></a> | <a href="README_zh-CN.md"><strong>中文</strong></a> | <a href="README_ja-JP.md"><strong>日本語</strong></a>
-</p>
-
-<div id="top" align="center">
-
-![Code License](https://img.shields.io/badge/Code%20License-Apache%202.0-brightgreen)
-[![arXiv](https://img.shields.io/badge/arXiv-2412.15208-b31b1b.svg)](https://arxiv.org/abs/2412.15208)
-
-</div>
+# Waymo Open Motion Dataset 2025 Vision-based End-to-End Challenge \\
+This repository is adopted from [OpenEMMA](https://github.com/taco-group/OpenEMMA) with my modifications to adapt to Waymo E2E dataset and challenge instead of NuScenes Dataset in its original implementation.
 
 
-# OpenEMMA: Open-Source Multimodal Model for End-to-End Autonomous Driving
-**OpenEMMA** is an open-source implementation of  [Waymo's End-to-End Multimodal Model for Autonomous Driving (EMMA)](https://waymo.com/blog/2024/10/introducing-emma/), offering an end-to-end framework for motion planning in autonomous vehicles. **OpenEMMA** leverages the pretrained world knowledge of Vision Language Models  (VLMs), such as GPT-4 and LLaVA, to integrate text and front-view camera inputs, enabling precise predictions of future ego waypoints and providing decision rationales. Our goal is to provide accessible tools for researchers and developers to advance autonomous driving research and applications.
+## Environment Setup:
+The environment.yaml file that I used on my workstation is also included. I used CUDA 12.8 to support my GPU with Python 3.10. Try creating the conda environment
+```
+conda create -f environment.yaml
+conda activate openemma_cu128
+```
+Alternatively, you can
+```
+pip install -r requirements.txt
+```
 
-<div align="center">
-  <img src="assets/EMMA-Paper-1__3_.webp" alt="EMMA diagram" width="800"/>
-  <p><em>Figure 1. EMMA: Waymo's End-to-End Multimodal Model for Autonomous Driving.</em></p>
-</div>
+See [OpenEMMA](https://github.com/taco-group/OpenEMMA) for detailed instructions on environment setup and dependency setup.
 
-<div align="center">
-  <img src="assets/openemma-pipeline.png" alt="OpenEMMA diagram" width="800"/>
-  <p><em>Figure 2. OpenEMMA: Our Open-Source End-to-End Autonomous Driving Framework based on Pre-trained VLMs.</em></p>
-</div>
+## Data Downloading:
+You can download data from Google Cloud Buckets from [Waymo](https://waymo.com/open/download) website. The easiest way to download the data is to install gsutil and use the command
+```
+gsutil cp -r <bucket address. starts with gs:// > <destination folder directory>
+```
+## Data preprocessing:
+After downloading the Waymo Open Motion Dataset (Waymo E2E). You can start preprocessing data, which generates pickle files for each scenario in the raw data proto. Note that training and test dataset pkl files are very large in size. So, you can choose the threshold number to limit the preprocessing.
+```
+waymo_data_preprocess.ipynb
+```
+The data directory must follow this hierarchy
+```
+├── <preprocessed_data_folder_name>
+│   ├── val
+│   │   ├── ...
+│   ├── testing
+│   │   ├── ...
 
-### News
-- **[2025/1/12]** 🔥**OpenEMMA** is now available as a PyPI package! You can install it using `pip install openemma`. 
-- **[2024/12/19]** 🔥We released **OpenEMMA**, an open-source project for end-to-end motion planning in autonomous driving tasks. Explore our [paper](https://arxiv.org/abs/2412.15208) for more details.
+```
 
-### Table of Contents
-- [Demos](#demos)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Contact](#contact)
-- [Citation](#citation)
+## Data Sorting:
+Since the raw data is not sorted by segment sequences and is randomly shuffled, we need to know the list of indices per segments to use the sequential WaymoE2EFrame() data. 
+See [Waymo GitHub Issue](https://github.com/waymo-research/waymo-open-dataset/issues/921) for more details on this issue.
+After preprocessing, run the following script to generate the json file that maps segment id to the list of indices.
+```
+python waymo_e2e_dataset_segmentation.py --data-dir <Path-to-raw-data-folder> --dataset <Dataset type: ['val','testing']>
+```
 
-### Demos
-![](assets/scene-0061.gif)
+## Inference: 
+VLM models that are supported out-of-the-box are qwen and llava. You can use your OPENAI_API_KEY to use GPT-4 for inference. See [OpenEMMA](https://github.com/taco-group/OpenEMMA) for more details.
+```
+python main.py --model-path <qwen,gpt,llava> --dataset <testing or val> --dataset-dir <Path to Waymo E2E preprocessed data folder>
+```
 
-![](assets/scene-0103.gif)
+## Submission Generation:
+See 
+```
+waymo_submission.ipynb
+```
 
-![](assets/scene-1077.gif)
+# Acknowledgement
+The majority of the code is from [OpenEMMA](https://github.com/taco-group/OpenEMMA)
 
-### Installation  
-To get started with OpenEMMA, follow these steps to set up your environment and dependencies.
-
-1. **Environment Setup**  
-   Set up a Conda environment for OpenEMMA with Python 3.8:
-   ```bash
-   conda create -n openemma python=3.8
-   conda activate openemma
-   ```
-2. **Install OpenEMMA**   
-You can now install OpenEMMA with a single command using PyPI:
-    ```bash
-    pip install openemma
-    ```
-    Alternatively, follow these steps:
-    - **Clone OpenEMMA Repository**   
-        Clone the OpenEMMA repository and navigate to the root directory:
-        ```bash
-        git clone git@github.com:taco-group/OpenEMMA.git
-        cd OpenEMMA
-        ```
-    - **Install Dependencies**  
-        Ensure you have cudatoolkit installed. If not, use the following command:
-        ```bash
-        conda install nvidia/label/cuda-12.4.0::cuda-toolkit
-        ```
-        To install the core packages required for OpenEMMA, run the following command:
-        ```bash
-        pip install -r requirements.txt
-        ```
-        This will install all dependencies, including those for YOLO-3D, an external tool used for critical object detection. The weights needed to run YOLO-3D will be automatically downloaded during the first execution.
-
-3. **Set up GPT-4 API Access**  
-    To enable GPT-4’s reasoning capabilities, obtain an API key from OpenAI. You can add your API key directly in the code where prompted or set it up as an environment variable:
-    ```bash
-    export OPENAI_API_KEY="your_openai_api_key"
-    ```
-    This allows OpenEMMA to access GPT-4 for generating future waypoints and decision rationales.
-
-### Usage  
-After setting up the environment, you can start using OpenEMMA with the following instructions:
-
-1. **Prepare Input Data**   
-    Download and extract the [nuScenes dataset](https://www.nuscenes.org/nuscenes#download)
-    
-2. **Run OpenEMMA**  
-    Use the following command to execute OpenEMMA's main script:
-    - PyPI:
-    ```bash
-    openemma \
-        --model-path qwen \
-        --dataroot [dir-of-nuScenes-dataset] \
-        --version [version-of-nuScenes-dataset] \
-        --method openemma
-    ```
-    - Github Repo:
-    ```bash
-    python main.py \
-        --model-path qwen \
-        --dataroot [dir-of-nuscnse-dataset] \
-        --version [version-of-nuscnse-dataset] \
-        --method openemma
-    ```
-
-    Currently, we support the following models: `GPT-4o`, `LLaVA-1.6-Mistral-7B`, `Llama-3.2-11B-Vision-Instruct`, and `Qwen2-VL-7B-Instruct`. To use a specific model, simply pass `gpt`, `llava`, `llama`, and `qwen`as the argument to `--model-path`.
-
-3. **Output Interpretation**   
-    After running the model, OpenEMMA generates the following output in the `./qwen-results` location:
-
-    - **Waypoints**: A list of future waypoints predicting the ego vehicle’s trajectory.
-
-    - **Decision Rationales**: Text explanations of the model’s reasoning, including scene context, critical objects, and behavior decisions.
-
-    - **Annotated Images**: Visualizations of the planned trajectory and detected critical objects overlaid on the original images.
-
-    - **Compiled Video**: A video (e.g., `output_video.mp4`) created from the annotated images, showing the predicted path over time.
-
-## Contact
-For help or issues using this package, please submit a GitHub issue.
-
-For personal communication related to this project, please contact Shuo Xing (shuoxing@tamu.edu).
-
-## Citation
-We are more than happy if this code is helpful to your work. 
-If you use our code or extend our work, please consider citing our paper:
-
-```bibtex
-
-@article{openemma,
-	author = {Xing, Shuo and Qian, Chengyuan and Wang, Yuping and Hua, Hongyuan and Tian, Kexin and Zhou, Yang and Tu, Zhengzhong},
-	title = {OpenEMMA: Open-Source Multimodal Model for End-to-End Autonomous Driving},
-	journal = {arXiv},
-	year = {2024},
-	month = dec,
-	eprint = {2412.15208},
-	doi = {10.48550/arXiv.2412.15208}
-}
-
-
+# License
+All code in this repository is licensed under the Apache License 2.0.
