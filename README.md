@@ -56,7 +56,7 @@ python main_autoregressive.py --model-path <qwen,gpt,llava> --dataset <testing o
 
 # Video Generation:
 ```
-python run_video --input <path to folder that contains all the results for the segment id per frame>
+python generate_video.py --input <path to folder that contains all the results for the segment id per frame>
 ```
 
 ## Submission Generation:
