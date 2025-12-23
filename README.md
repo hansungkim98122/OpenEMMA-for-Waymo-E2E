@@ -40,13 +40,23 @@ Since the raw data is not sorted by segment sequences and is randomly shuffled, 
 See [Waymo GitHub Issue](https://github.com/waymo-research/waymo-open-dataset/issues/921) for more details on this issue.
 After preprocessing, run the following script to generate the json file that maps segment id to the list of indices.
 ```
-python waymo_e2e_dataset_segmentation.py --data-dir <Path-to-raw-data-folder> --dataset <Dataset type: ['val','testing']>
+python waymo_e2e_dataset_segmentation.py --data-dir <path-to-raw-data-folder> --dataset <dataset type: ['val','testing']>
 ```
 
-## Inference: 
+## Inference Results Generation (Single Segment at the last frame): 
 VLM models that are supported out-of-the-box are qwen and llava. You can use your OPENAI_API_KEY to use GPT-4 for inference. See [OpenEMMA](https://github.com/taco-group/OpenEMMA) for more details.
 ```
-python main.py --model-path <qwen,gpt,llava> --dataset <testing or val> --dataset-dir <Path to Waymo E2E preprocessed data folder>
+python main.py --model-path <qwen,gpt,llava> --dataset <testing or val> --dataset-dir <path to Waymo E2E preprocessed data folder>
+```
+
+# Inference for Visualization (All frames in a single segment):
+```
+python main_autoregressive.py --model-path <qwen,gpt,llava> --dataset <testing or val> --dataset-dir <path to Waymo E2E preprocessed data folder> --id <Segment id that you wish to run. Must exist in the dataset>
+```
+
+# Video Generation:
+```
+python run_video --input <path to folder that contains all the results for the segment id per frame>
 ```
 
 ## Submission Generation:
