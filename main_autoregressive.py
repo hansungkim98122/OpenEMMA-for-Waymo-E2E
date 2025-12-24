@@ -497,8 +497,8 @@ def main():
     parser.add_argument("--plot", type=bool, default=True)
     parser.add_argument("--method", type=str, default="openemma")
     parser.add_argument("--dataset", type=str, default="val")
-    parser.add_argument("--id",type=str,required=True,description="Waymo E2E dataset UIUD number")
-    parser.add_argument("--dataset-dir", type=str, required=True, description='Path to Waymo E2E Preprocessed Dataset')
+    parser.add_argument("--id",type=str,required=True)
+    parser.add_argument("--dataset-dir", type=str, required=True)
     args = parser.parse_args()
     print(args.model_path)
 
@@ -523,7 +523,7 @@ def main():
                     raise RuntimeError("Qwen2_5_VLForConditionalGeneration not available in transformers.")
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     "/root/OpenEMMA/models/Qwen2.5-VL-3B-Instruct",
-                    torch_dtype=torch.bfloat16,
+                    dtype=torch.bfloat16,
                     attn_implementation="flash_attention_2",
                     device_map="auto",
                 )
@@ -534,7 +534,7 @@ def main():
                 print("Falling back to Qwen2-VL-7B-Instruct:", e)
                 model = Qwen2VLForConditionalGeneration.from_pretrained(
                     "Qwen/Qwen2-VL-7B-Instruct",
-                    torch_dtype=torch.bfloat16,
+                    dtype=torch.bfloat16,
                     device_map="auto",
                 )
                 processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
@@ -569,7 +569,7 @@ def main():
         NotImplementedError
     id = args.id
     for index in tqdm.tqdm(range(len(segments_json[id]))):
-        outdir = os.path.join(f"{args.model_path}_results", args.method, args.dataset,id+'_'+index)
+        outdir = os.path.join(f"{args.model_path}_results", args.method, args.dataset,id,str(index))
         print(outdir, ' created')
         os.makedirs(outdir, exist_ok=True)
         image_history = []
@@ -589,7 +589,7 @@ def main():
 
         #  Pose / trajectory 
         #Use last frame only for ego pose/trajectory
-        pose = data_dict["ego_history_xyz"].squeeze(0).squeeze(0).numpy()  # (T,3)
+        pose = data_dict["ego_history_xyz"]  # (T,3)
         xy = pose[:, :2].astype(float)
 
         # Normalize to ego@t0 so last observed is [0,0] and heading aligns +x

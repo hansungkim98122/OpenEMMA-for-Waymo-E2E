@@ -35,6 +35,6 @@ def main(args):
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="testing")
-    parser.add_argument("--dataset-dir", type=str, required=True, description='Path to Waymo E2E Preprocessed Dataset')
+    parser.add_argument("--dataset-dir", type=str, required=True)
     args = parser.parse_args()
     main(args)
