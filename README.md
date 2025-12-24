@@ -21,7 +21,7 @@ You can download data from Google Cloud Buckets from [Waymo](https://waymo.com/o
 gsutil cp -r <bucket address. starts with gs:// > <destination folder directory>
 ```
 ## Data preprocessing:
-After downloading the Waymo Open Motion Dataset (Waymo E2E). You can start preprocessing data, which generates pickle files for each scenario in the raw data proto. Note that training and test dataset pkl files are very large in size. So, you can choose the threshold number to limit the preprocessing.
+After downloading the Waymo Open Motion Dataset (Waymo E2E). You can start preprocessing data, which generates pickle files for each scenario in the raw data proto. Note that training and test dataset pkl files are very large in size. So, you can choose the threshold number to limit the preprocessing. Run this in a different environment as Python 3.10 is not compatible with Waymo-open-dataset. See [WOMD-GitHub](https://github.com/waymo-research/waymo-open-dataset) for more detailed instructions on setting up the environment to run their library.
 ```
 waymo_data_preprocess.ipynb
 ```
@@ -56,8 +56,10 @@ python main_autoregressive.py --model-path <qwen,gpt,llava> --dataset <testing o
 
 # Video Generation:
 ```
-python generate_video.py --input <path to folder that contains all the results for the segment id per frame>
+python generate_video.py --id <UUID of Waymo E2E Data Segment>--input <path to folder that contains all the results for the segment id per frame>
 ```
+<!-- python generate_video.py --id <id> --inference_input /home/hansung/OpenEMMA/qwen_results/testing/id --dataset-dir waymo_dataset -->
+
 
 ## Submission Generation:
 See 
