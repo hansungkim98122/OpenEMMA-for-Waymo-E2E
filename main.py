@@ -437,6 +437,8 @@ def GenerateMotion(obs_image, obs_ego_xy, given_intent,
 
     OUTPUT ONLY JSON with EXACTLY {FUT_LEN} deltas:
     {{"deltas":[[dx1,dy1],[dx2,dy2],...,[dx{FUT_LEN},dy{FUT_LEN}]]}}
+
+    You must output the requested deltas.
     """.strip()
     
     
@@ -483,6 +485,37 @@ def fix_deltas_to_len(deltas, fut_len, obs_ego_xy, dt):
 def load_dict_from_pickle(path: str) -> dict:
     with open(path,'rb') as f:
         return pickle.load(f)
+
+def get_min_h_w(data_dict,cam_list):
+    min_h = 100000
+    min_w = 100000
+    for id in cam_list:
+        h,w = data_dict['image_frames'][id].shape[1], data_dict['image_frames'][id].shape[2]
+        min_h = min(min_h, h)
+        min_w = min(min_w, w)
+    return min_h, min_w
+
+def resize_imgs(data_dict, cam_list):
+    min_h, min_w = get_min_h_w(data_dict, cam_list)
+
+    for cam in cam_list:
+        img = data_dict["image_frames"][cam]  # (T, C, H, W) or (C, H, W)?
+
+        # If you actually have a single frame (C,H,W), make it (1,C,H,W)
+        if img.dim() == 3:
+            img_b = img.unsqueeze(0)  # (1,C,H,W)
+            resized = F.interpolate(img_b.float(), size=(min_h, min_w),
+                                    mode="bilinear", align_corners=False)
+            resized = resized.squeeze(0).to(img.dtype)  # (C,min_h,min_w)
+        elif img.dim() == 4:
+            # For (T,C,H,W): resize each frame in one call (treat T as batch)
+            resized = F.interpolate(img.float(), size=(min_h, min_w),
+                                    mode="bilinear", align_corners=False)
+            resized = resized.to(img.dtype)  # (T,C,min_h,min_w)
+        else:
+            raise ValueError(f"Unexpected img shape: {img.shape}")
+
+        data_dict["image_frames"][cam] = resized
 
 def main():
     parser = argparse.ArgumentParser()
@@ -560,24 +593,19 @@ def main():
     else:
         NotImplementedError
 
-    skip = True
     for id in tqdm.tqdm(segments_json.keys()):
-        if id == '5d1ea6ef0e47b35dffa21e9d79220b72':
-            skip = False
-        if skip: continue
         outdir = os.path.join(f"{args.model_path}_results", args.method, args.dataset,id)
         print(outdir, ' created')
-        os.makedirs(outdir, exist_ok=True)
-
+        os.makedirs(outdir, exist_ok=True)   
         image_history = []
+        cam_list = [1, 0, 2]
         for segment in segments_json[id]:
             data_dict = load_dict_from_pickle(args.dataset_dir + args.dataset + "/" + id + "-" + str(segment) + '.pkl')
 
             #  Build stitched image (front-left, front, front-right) 
-            cam_list = [1, 0, 2]
-            cam_front_data = []
+            cam_front_data = []  
             for cam in cam_list:
-                cam_front_data.append(data_dict["image_frames"][cam, ...].numpy().squeeze(0))  # (3,H,W)
+                cam_front_data.append(data_dict["image_frames"][cam, ...].numpy().squeeze(0))   # (3,H,W)
             cam_front_data = np.concatenate(cam_front_data, axis=-1)  # concat width
             curr_image = chw_rgb_to_pil(cam_front_data)
             image_history.append(curr_image)

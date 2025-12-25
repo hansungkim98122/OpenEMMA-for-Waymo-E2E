@@ -445,6 +445,8 @@ def GenerateMotion(obs_image, obs_ego_xy, given_intent,
 
     OUTPUT ONLY JSON with EXACTLY {FUT_LEN} deltas:
     {{"deltas":[[dx1,dy1],[dx2,dy2],...,[dx{FUT_LEN},dy{FUT_LEN}]]}}
+
+    You must output the requested deltas.
     """.strip()
     
     out = vlm_inference(

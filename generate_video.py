@@ -5,6 +5,7 @@ import cv2
 import tensorflow as tf
 tf.config.set_visible_devices([], 'GPU')
 import os
+import torch
 import io
 import pickle
 import tqdm
@@ -23,7 +24,7 @@ def return_row(data_dict,order):
 
    order = [o-1 for o in order] #0-first indexing
    for cam_ind in order: 
-      image = data_dict['image_frames'][cam_ind].squeeze(0)
+      image = data_dict['raw_image_frame'][cam_ind].squeeze(0)
       K = data_dict['camera_intrinsic'][cam_ind][0]
       dist = data_dict['camera_intrinsic'][cam_ind][1]
       intrinsic = [K[0,0], K[1,2,],K[0,2], K[1,2]] + list(dist)
@@ -74,16 +75,31 @@ def project_vehicle_to_image(vehicle_pose, calibration, points):
                                             camera_image_metadata,
                                             world_points).numpy()
 
-def draw_points_on_image(image, points, size=6, color='r'):
-    h, w = image.shape[:2]
-    if color == 'r': 
-        rgb = (255, 0, 0) 
-    elif color =='b':
-        rgb = (0, 0, 255)
-    elif color == 'g':
-        rgb = (0,255,0)
+def _as_cv2_img(image: np.ndarray) -> np.ndarray:
+    """Return a contiguous, writable HWC uint8 array that OpenCV can draw on."""
+    img = np.asarray(image)
+
+    # If CHW, convert to HWC
+    if img.ndim == 3 and img.shape[0] == 3 and img.shape[-1] != 3:
+        img = np.transpose(img, (1, 2, 0))
+
+    # Ensure dtype uint8 (OpenCV likes this for drawing)
+    if img.dtype != np.uint8:
+        img = img.astype(np.uint8)
+
+    # Make contiguous + writable
+    if (not img.flags["C_CONTIGUOUS"]) or (not img.flags["WRITEABLE"]):
+        img = np.ascontiguousarray(img).copy()
     else:
-        NotImplementedError
+        # still copy if you suspect it's a view with weird strides
+        img = img.copy()
+
+    return img
+
+def draw_points_on_image(image, points, size=6, color='r'):
+    image = _as_cv2_img(image)
+    h, w = image.shape[:2]
+    rgb = (255, 0, 0) if color == 'r' else (0, 0, 255)
 
     for u, v, ok in points:
         if not bool(ok):
@@ -91,8 +107,8 @@ def draw_points_on_image(image, points, size=6, color='r'):
         u_i, v_i = int(round(u)), int(round(v))
         if 0 <= u_i < w and 0 <= v_i < h:
             cv2.circle(image, (u_i, v_i), size, rgb, -1)
-
-    return image
+       
+    return image.transpose(2,0,1)
 
 def load_dict_from_pickle(path: str) -> dict:
     with open(path,'rb') as f:
@@ -150,8 +166,8 @@ def plot_topdown_view(future_waypoints_matrix, past_waypoints_matrix, s, visuali
     max_extent = max(max_extent, 6.0)  # minimum zoom so ego box isn't huge
     pad = 1.2
     lim = pad * max_extent
-    ax.set_xlim(-lim, lim)
-    ax.set_ylim(-lim, lim)
+    ax.set_xlim(-30, 30)
+    ax.set_ylim(-30, 30)
 
     if visualize:
         plt.show()
@@ -210,10 +226,12 @@ def main(args):
             waypoints_camera_space = project_vehicle_to_image(vehicle_pose, top_calibration_list[i], future_waypoints_matrix)
             if pred_traj is not None:
                 waypoints_generated = project_vehicle_to_image(vehicle_pose, top_calibration_list[i], pred_traj)
-                top_images_list[i] = draw_points_on_image(top_images_list[i], waypoints_generated, size=15,color='b')
-            images_with_drawn_points.append(draw_points_on_image(top_images_list[i], waypoints_camera_space, size=15))
+                top_images_list[i] = draw_points_on_image(top_images_list[i], waypoints_generated, size=8,color='b')
+            top_images_list[i] = draw_points_on_image(top_images_list[i], waypoints_camera_space, size=8)
+            images_with_drawn_points.append(top_images_list[i])
+
         top_row_image = np.concatenate(images_with_drawn_points, axis=2)
- 
+
         #Draw the bottom row (rear view cameras) with past waypoint overlay
         bottom_images_list, bottom_calibration_list = return_row(data_dict,[8,7,6])
 
@@ -223,7 +241,12 @@ def main(args):
         for i in range(len(bottom_calibration_list)):
             bottom_row_width += bottom_calibration_list[i]['width']
             waypoints_camera_space = project_vehicle_to_image(vehicle_pose, bottom_calibration_list[i], past_waypoints_matrix)
-            bottom_images_list[i] = draw_points_on_image(bottom_images_list[i], waypoints_camera_space, size=15, color='g')
+            bottom_images_list[i] = draw_points_on_image(bottom_images_list[i], waypoints_camera_space, size=8, color='g')
+            if i == 1:
+                height_difference = bottom_calibration_list[0]['height'] - bottom_calibration_list[1]['height']
+                blackout = np.zeros((3, height_difference, bottom_calibration_list[1]['width']), dtype=bottom_images_list[1].dtype)
+                bottom_images_list[1] = np.concatenate([bottom_images_list[1],blackout],axis=1)
+
             images_with_drawn_points.append(bottom_images_list[i])
         bottom_row_image = np.concatenate(images_with_drawn_points, axis=2)
 
