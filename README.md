@@ -1,6 +1,7 @@
 # Waymo Open Motion Dataset 2025 Vision-based End-to-End Challenge
 This repository is adopted from [OpenEMMA](https://github.com/taco-group/OpenEMMA) with my modifications to adapt to Waymo E2E dataset and challenge instead of NuScenes Dataset in its original implementation.
 
+[![Here](https://youtu.be/pNwgcMBZNsA)](https://youtu.be/pNwgcMBZNsA)
 
 ## Environment Setup:
 The environment.yaml file that I used on my workstation is also included. I used CUDA 12.8 to support my GPU with Python 3.10. Try creating the conda environment
