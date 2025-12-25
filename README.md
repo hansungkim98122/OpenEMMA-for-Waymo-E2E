@@ -14,7 +14,7 @@ Alternatively, you can
 pip install -r requirements.txt
 ```
 
-See [OpenEMMA](https://github.com/taco-group/OpenEMMA) for detailed instructions on environment setup and dependency setup.
+See [OpenEMMA](assets/thumbnail.png) for detailed instructions on environment setup and dependency setup.
 
 ## Data Downloading:
 You can download data from Google Cloud Buckets from [Waymo](https://waymo.com/open/download) website. The easiest way to download the data is to install gsutil and use the command
