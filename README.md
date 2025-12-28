@@ -70,8 +70,11 @@ See
 waymo_submission.ipynb
 ```
 
-# Acknowledgement
+# Other work:
+Check out my other work in other Waymo Open Dataset Challenges [https://github.com/hansungkim98122/Sim-Agent-SMART-RL](https://github.com/hansungkim98122/Sim-Agent-SMART-RL)
+
+# Acknowledgement:
 The majority of the code is from [OpenEMMA](https://github.com/taco-group/OpenEMMA)
 
-# License
+# License:
 All code in this repository is licensed under the Apache License 2.0.
