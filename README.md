@@ -58,7 +58,8 @@ python main_autoregressive.py --model-path <qwen,gpt,llava> --dataset <testing o
 ```
 python generate_video.py --id <UUID of Waymo E2E Data Segment>--input <path to folder that contains all the results for the segment id per frame>
 ```
-<!-- python generate_video.py --id <id> --inference_input /home/hansung/OpenEMMA/qwen_results/testing/id --dataset-dir waymo_dataset -->
+<!-- python generate_video.py --id 2dd9daa2312e66da3c0ea477145b70b8 --inference-input /home/hansung/OpenEMMA/qwen_results/poutine/val/2dd9daa2312e66da3c0ea477145b70b8 --dataset-dir waymo_dataset/
+-->
 
 
 ## Submission Generation:

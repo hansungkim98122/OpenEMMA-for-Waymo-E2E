@@ -168,6 +168,7 @@ def plot_topdown_view(future_waypoints_matrix, past_waypoints_matrix, s, visuali
     lim = pad * max_extent
     ax.set_xlim(-30, 30)
     ax.set_ylim(-30, 30)
+    ax.invert_xaxis()  # invert x for bottom-left BEV view
 
     if visualize:
         plt.show()
