@@ -3,6 +3,8 @@ Coming soon 🚀: [NVIDIA Alpamayo-R1](https://github.com/NVlabs/alpamayo) adapt
 # Waymo Open Motion Dataset 2025 Vision-based End-to-End Challenge
 This repository is adopted from [OpenEMMA](https://github.com/taco-group/OpenEMMA) with my modifications to adapt to Waymo E2E dataset and challenge instead of NuScenes Dataset in its original implementation.
 
+Waymo E2E Challenge Submission: https://waymo.com/open/challenges/e2e-driving/results/20ae7005-7b50/1766540526452000/
+
 [![Here](assets/thumbnail.png)](https://youtu.be/ljEmEhd1oU0)
 
 ## Environment Setup:
